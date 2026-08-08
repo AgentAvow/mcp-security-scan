@@ -32,6 +32,10 @@ def _result_to_dict(r: ScanResult) -> dict:
         "framework": r.framework,
         "primary_language": r.primary_language,
         "files_scanned": r.files_scanned,
+        # Coverage disclosure (#4): total scannable files and whether this grade is only
+        # a sample of the repo (scannable files exceeded the per-repo scan cap).
+        "total_scannable_files": r.total_scannable_files,
+        "sampled": r.sampled,
         "has_readme": r.has_readme,
         "has_license": r.has_license,
         "has_tests": r.has_tests,
@@ -63,7 +67,20 @@ def _print_summary(result: ScanResult) -> None:
         return
 
     print(f"\n  Trust Score: {result.trust_score}/100", file=sys.stderr)
-    print(f"  Files Scanned: {result.files_scanned}", file=sys.stderr)
+    if result.sampled:
+        # Coverage disclosure (#4): the grade covers only a sample of the repo.
+        print(
+            f"  Files Scanned: {result.files_scanned} "
+            f"(SAMPLED — {result.total_scannable_files} scannable, "
+            f"grade covers a subset)",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            f"  Files Scanned: {result.files_scanned} "
+            f"of {result.total_scannable_files} scannable",
+            file=sys.stderr,
+        )
     print(f"  Language: {result.primary_language}", file=sys.stderr)
     print(
         f"  Findings: {len(result.findings)} "
@@ -148,7 +165,16 @@ def _format_github_comment(result: ScanResult) -> str:
     lines.append("")
     lines.append("| Metric | Value |")
     lines.append("|--------|-------|")
-    lines.append(f"| Files scanned | {result.files_scanned} |")
+    if result.sampled:
+        lines.append(
+            f"| Files scanned | {result.files_scanned} "
+            f"(sampled — {result.total_scannable_files} scannable) |"
+        )
+    else:
+        lines.append(
+            f"| Files scanned | {result.files_scanned} "
+            f"of {result.total_scannable_files} scannable |"
+        )
     lines.append(f"| Language | {result.primary_language} |")
 
     if result.positive_signals:
