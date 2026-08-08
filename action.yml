@@ -1,6 +1,6 @@
 name: "MCP Security Scan"
 description: "Security scanner for MCP servers — detects hardcoded secrets, unsafe execution, data exfiltration, filesystem risks, and missing auth. Generates trust scores and posts results as PR comments."
-author: "AgentGraph"
+author: "AgentAvow"
 
 branding:
   icon: "shield"
