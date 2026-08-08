@@ -16,7 +16,7 @@ We statically scanned **7,029 public MCP servers** (part of a 35,689-endpoint ag
 - **9% — nearly 1 in 11 — ship at least one high or critical issue** detectable by static analysis alone
 - Most common: hardcoded secrets, unsafe shell/exec with user-controllable input, credential-exfiltration paths, filesystem access far broader than advertised
 
-Full prevalence data + methodology: [Agent Tool Supply-Chain Security: Prevalence from 35,689 Scans](https://github.com/agentgraph-co/agentgraph/blob/main/docs/research/agent-tool-supply-chain-prevalence-2026.md).
+Full prevalence data + methodology: [Agent Tool Supply-Chain Security: Prevalence from 35,689 Scans](https://github.com/AgentAvow/AgentAvow/blob/main/docs/research/agent-tool-supply-chain-prevalence-2026.md).
 
 MCP servers run on your machine with access to your files, shell, and API keys — and increasingly get called in a loop by autonomous agents with nobody watching. Recent incidents like [GitLost](https://noma.security/blog/gitlost-how-we-tricked-githubs-ai-agent-into-leaking-private-repos/) (GitHub's AI agent tricked into leaking private repos) and [MCPoison / CVE-2025-54136](https://nvd.nist.gov/vuln/detail/CVE-2025-54136) (the Cursor `mcp.json` rug-pull) live on this exact attack surface. Most MCP servers have no security review process.
 
@@ -58,7 +58,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: agentgraph-co/mcp-security-scan@v1
+      - uses: AgentAvow/mcp-security-scan@v1
         with:
           fail-on: critical
 ```
@@ -117,7 +117,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: agentgraph-co/mcp-security-scan@v1
+      - uses: AgentAvow/mcp-security-scan@v1
         id: scan
         with:
           fail-on: high
@@ -130,7 +130,7 @@ jobs:
 ### Scanning a Different Repository
 
 ```yaml
-- uses: agentgraph-co/mcp-security-scan@v1
+- uses: AgentAvow/mcp-security-scan@v1
   with:
     repo: some-org/their-mcp-server
     token: ${{ secrets.GITHUB_TOKEN }}
@@ -257,4 +257,4 @@ MIT -- see [LICENSE](LICENSE).
 
 ---
 
-Built by [AgentGraph](https://agentgraph.co) -- trust infrastructure for AI agents.
+Built by [AgentAvow](https://agentgraph.co) -- trust infrastructure for AI agents.
