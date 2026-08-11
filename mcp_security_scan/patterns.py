@@ -96,7 +96,9 @@ UNSAFE_EXEC_PATTERNS: list[tuple[str, re.Pattern[str], str]] = [
     ),
     (
         "exec() call (Python)",
-        re.compile(r"\bexec\s*\("),
+        # Negative lookbehind excludes method calls (`re.compile(...).exec()`,
+        # `regexp.exec()`) so a `.exec()` doesn't false-fire as Python's exec builtin.
+        re.compile(r"(?<![.\w])exec\s*\("),
         "high",
     ),
     (
@@ -106,7 +108,9 @@ UNSAFE_EXEC_PATTERNS: list[tuple[str, re.Pattern[str], str]] = [
     ),
     (
         "execSync / spawn (Node.js)",
-        re.compile(r"\b(?:execSync|spawnSync|exec)\s*\("),
+        # Lookbehind excludes method calls (`foo.exec(...)`) so only the real
+        # child_process sinks fire, not any object's `.exec()`.
+        re.compile(r"(?<![.\w])(?:execSync|spawnSync|exec)\s*\("),
         "high",
     ),
     (
@@ -555,7 +559,11 @@ PROMPT_INJECTION_PATTERNS: list[tuple[str, re.Pattern[str], str]] = [
     (
         "Injected system/role directive",
         re.compile(
-            r"<\s*/?\s*(?:system|important|instructions?)\s*>"
+            # Tag names are case-SENSITIVE (lowercase) via the scoped (?-i:) flag:
+            # real injection tags are `<system>` / `</instructions>`, while PascalCase
+            # generic types in typed languages (Rust/TS `Vec<Instruction>`, `<System>`)
+            # are NOT injection and must not false-fire.
+            r"<\s*/?\s*(?-i:system|important|instructions?)\s*>"
             r"|(?:^|[\s\"'])system\s*prompt\s*:"
             r"|you\s+are\s+now\s+(?:a|an|the)?\s"
             r"|your\s+(?:new|real|actual)\s+(?:instructions?|task|role)\s+(?:is|are)",
