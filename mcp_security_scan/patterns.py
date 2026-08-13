@@ -90,8 +90,11 @@ UNSAFE_EXEC_PATTERNS: list[tuple[str, re.Pattern[str], str]] = [
         "high",
     ),
     (
-        "eval() call",
-        re.compile(r"\beval\s*\("),
+        "eval() call (Python)",
+        # Negative lookbehind excludes method calls and identifiers ending in
+        # `eval` (`df.eval(...)`, `pd.eval(...)`, `retrieval(...)`, `my_eval(...)`)
+        # so only Python's bare eval() builtin fires — not pandas/PyO3 `.eval()`.
+        re.compile(r"(?<![.\w])eval\s*\("),
         "high",
     ),
     (

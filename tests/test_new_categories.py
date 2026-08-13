@@ -168,3 +168,20 @@ def test_skill_md_is_scanned():
     assert _is_source_file("skills/SKILL.md")
     assert _is_source_file("mcp.json")
     assert not _is_source_file("README.md")
+
+
+# --- unsafe_exec eval() false-positive guard (negative lookbehind) ---
+
+def test_bare_eval_flagged():
+    assert "unsafe_exec" in _categories('result = eval(user_input)\n')
+
+
+def test_method_call_eval_not_flagged():
+    # df.eval() / pd.eval() (pandas) and PyO3 py.eval() are not the eval builtin.
+    assert "unsafe_exec" not in _categories('total = df.eval("a + b")\n')
+
+
+def test_identifier_ending_in_eval_not_flagged():
+    # retrieval(...) / my_eval(...) merely end in "eval".
+    code = 'docs = retrieval(query)\nx = my_eval(expr)\n'
+    assert "unsafe_exec" not in _categories(code)
